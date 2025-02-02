@@ -1,30 +1,29 @@
 #!/bin/bash
 # gdrive_mount.sh
 # A single script to manage an rclone mount with interactive drive configuration,
-# automatic mounting/unmounting, periodic network check, and cleaning.
+# automatic mounting/unmounting via periodic network check, and cleaning.
 #
 # Usage:
 #   ./gdrive_mount.sh {setup|mount|unmount|check|clean} [config_file]
 #
-# The optional config_file argument defaults to "./gdrive_mount.conf" if not provided.
+# The config_file argument is based on the script's directory or provided explicitly
+# (e.g., if you call: ./gdrive_mount.sh setup myconfig then it looks for "myconfig.cfg")
 #
 # Make sure this script is executable: chmod +x gdrive_mount.sh
 
 set -euo pipefail
 
 #############################
-# Global Variables
-#############################
-
-# Set the check interval in minutes.
-# You can also define this in your config file if desired.
-CHECK_INTERVAL="${CHECK_INTERVAL:-5}"  # Default is 5 minutes if not already set.
-
-#############################
 # Load External Configuration
 #############################
+# Determine the directory where the script is located.
+SCRIPT_DIR="$(dirname "$(realpath "$0")")"
 
-CONFIG_FILE="${2:-./gdrive_mount.conf}"
+# Build the config file path.
+CONFIG_FILE="$2"
+if [[ ! -f "$CONFIG_FILE" ]]; then
+  CONFIG_FILE="$SCRIPT_DIR/$2.cfg"
+fi
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
   echo "Config file '$CONFIG_FILE' not found. Exiting."
@@ -55,11 +54,23 @@ fi
 source "$CONFIG_FILE"
 
 #############################
+# Global Variables
+#############################
+
+# Set the check interval in minutes (default is 1 minute).
+CHECK_INTERVAL="${CHECK_INTERVAL:-1}"
+
+# Set defaults if not provided in the config file.
+CACHE_DIR=${CACHE_DIR:-"${HOME}/.config/gdrive_mount_cache/${MOUNT_NAME}"}
+RCLONE_OPTIONS=${RCLONE_OPTIONS:-"--vfs-cache-mode full --daemon"}
+# For systemd calls we remove the --daemon flag (see mount_drive below).
+MOUNT_POINT="${HOME}/mnt/${MOUNT_NAME}"
+
+#############################
 # Interactive Remote Setup
 #############################
 
 setup_drive_config() {
-  # Check if REMOTE is already set.
   if [[ -z "${REMOTE:-}" ]]; then
     echo "REMOTE variable is not set in ${CONFIG_FILE}."
     echo "Let's configure your Google Drive remote for rclone."
@@ -78,7 +89,6 @@ setup_drive_config() {
     echo "Your remote is now set to: ${REMOTE}"
     echo
     echo "Updating configuration file (${CONFIG_FILE}) with REMOTE value..."
-    # Append REMOTE to the config file. (You could also update in place if desired.)
     echo "" >> "$CONFIG_FILE"
     echo "# Added by gdrive_mount.sh interactive setup on $(date)" >> "$CONFIG_FILE"
     echo "REMOTE=\"${REMOTE}\"" >> "$CONFIG_FILE"
@@ -92,10 +102,7 @@ setup_drive_config() {
 # Helper Functions
 #############################
 
-# Check if we're connected to an allowed Wi-Fi network.
 check_network() {
-  # This example uses 'iwgetid' to get the current SSID.
-  # Adjust this if your system uses another method (e.g., nmcli).
   CURRENT_SSID=$(iwgetid -r || echo "none")
   if [[ " ${ALLOWED_NETWORKS[*]} " =~ " ${CURRENT_SSID} " ]]; then
     echo "Connected to allowed network: ${CURRENT_SSID}"
@@ -106,49 +113,51 @@ check_network() {
   fi
 }
 
-# Mount the rclone remote. This command now mounts on any network.
 mount_drive() {
   echo "Attempting to mount ${REMOTE} at ${MOUNT_POINT}..."
 
-  # Create mount point and cache directory if they don't exist.
-  mkdir -p "$MOUNT_POINT" "$CACHE_DIR"
+  # Choose options based on whether called from systemd.
+  if [[ "${SYSTEMD_CALL:-}" == "1" ]]; then
+    echo "Running from systemd: disabling --daemon option"
+    RCLONE_OPTS="${RCLONE_OPTIONS/--daemon/}"
+  else
+    RCLONE_OPTS="$RCLONE_OPTIONS"
+  fi
 
-  # Run rclone mount. (Make sure your rclone config already includes the remote.)
+  # Ensure the mount point and cache directories exist.
+  #mkdir -p "$MOUNT_POINT" "$CACHE_DIR"
+
+  # Run rclone mount.
   rclone mount "${REMOTE}" "$MOUNT_POINT" \
     --cache-dir "$CACHE_DIR" \
-    $RCLONE_OPTIONS
+    $RCLONE_OPTS
 
   echo "Mount command issued. (Check with 'mount' or 'df' if needed.)"
 }
 
-# Unmount the rclone mount.
 unmount_drive() {
   echo "Attempting to unmount ${MOUNT_POINT}..."
-  # Use lazy unmount (-uz) so that it detaches even if busy.
   fusermount -uz "$MOUNT_POINT" && echo "Unmounted successfully." || echo "Unmount command may have failed or mount was not active."
 }
 
-# Check: Called periodically to verify allowed network connectivity.
-# If not connected to an allowed network, the drive is unmounted.
 check_drive() {
   echo "Performing periodic network check..."
-  if ! check_network; then
+  if check_network; then
+    echo "Network check passed. Attempting to mount drive if not already mounted."
+    if mountpoint -q "$MOUNT_POINT"; then
+      echo "Drive already mounted."
+    else
+      mount_drive
+    fi
+  else
     echo "Network check failed. Unmounting drive..."
     unmount_drive
-  else
-    echo "Network check passed. No action needed."
   fi
 }
 
-# Clean: Synchronize active changes and clear cache.
 clean_drive() {
   echo "Synchronizing mount and clearing cache..."
-  # Example: sync local changes back to remote.
-  # WARNING: rclone sync is one‐way and may delete files if not used carefully.
-  # Adjust the command below to match your intended direction.
   rclone sync "$MOUNT_POINT" "${REMOTE}" --verbose
-
-  # Clear the rclone VFS cache.
   if [[ -d "$CACHE_DIR" ]]; then
     echo "Clearing cache directory ${CACHE_DIR}..."
     rm -rf "${CACHE_DIR:?}/"*
@@ -158,76 +167,108 @@ clean_drive() {
   echo "Clean operation complete."
 }
 
-# Setup: Create sample systemd unit files for automounting and periodic network check.
+#############################
+# Setup: Create systemd user unit files for mounting and periodic network check.
+#############################
+
 setup_systemd() {
-  # First, ensure the drive configuration is set.
+  # Create necessary directories.
+  mkdir -p "$MOUNT_POINT" "$CACHE_DIR"
+  mkdir -p "$HOME/.config/systemd/user"
+
+  # Ensure the drive configuration is set.
   setup_drive_config
 
-  echo "Setting up systemd unit files for ${MOUNT_NAME}..."
+  echo "Setting up user systemd unit files for rclone mount for ${MOUNT_NAME}..."
 
-  # Determine the full path to this script.
   SCRIPT_PATH=$(realpath "$0")
 
-  # Service unit file for mounting the drive.
-  SERVICE_FILE="/etc/systemd/system/rclone-mount-${MOUNT_NAME}.service"
-  sudo tee "$SERVICE_FILE" > /dev/null <<EOF
-[Unit]
-Description=Rclone mount for ${MOUNT_NAME}
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=${SCRIPT_PATH} mount ${CONFIG_FILE}
-ExecStop=${SCRIPT_PATH} unmount ${CONFIG_FILE}
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  echo "Created systemd service file: ${SERVICE_FILE}"
-
-  # Create a service and timer for periodic network check.
-  CHECK_SERVICE_FILE="/etc/systemd/system/rclone-mount-${MOUNT_NAME}-check.service"
-  sudo tee "$CHECK_SERVICE_FILE" > /dev/null <<EOF
+  # Create a service unit file for periodic network check.
+  CHECK_SERVICE_FILE="$HOME/.config/systemd/user/rclone-mount-${MOUNT_NAME}-check.service"
+  tee "$CHECK_SERVICE_FILE" > /dev/null <<EOF
 [Unit]
 Description=Periodic network check for ${MOUNT_NAME} mount
 
 [Service]
 Type=oneshot
+Environment="SYSTEMD_CALL=1"
 ExecStart=${SCRIPT_PATH} check ${CONFIG_FILE}
 EOF
 
-  CHECK_TIMER_FILE="/etc/systemd/system/rclone-mount-${MOUNT_NAME}-check.timer"
-  sudo tee "$CHECK_TIMER_FILE" > /dev/null <<EOF
+  echo "Created user check service unit file: ${CHECK_SERVICE_FILE}"
+
+  # Create a timer unit file to run the network check.
+  # Here, we use a full calendar expression.
+  CHECK_TIMER_FILE="$HOME/.config/systemd/user/rclone-mount-${MOUNT_NAME}-check.timer"
+  tee "$CHECK_TIMER_FILE" > /dev/null <<EOF
 [Unit]
-Description=Run network check for ${MOUNT_NAME} every ${CHECK_INTERVAL} minutes
+Description=Run network check for ${MOUNT_NAME} every ${CHECK_INTERVAL} minute(s)
 
 [Timer]
-OnCalendar=*:0/${CHECK_INTERVAL}
+OnCalendar=*-*-* *:0/${CHECK_INTERVAL}:00
 Persistent=true
 
 [Install]
 WantedBy=timers.target
 EOF
 
-  echo "Created systemd timer and service for periodic network check."
-  echo "Reloading systemd daemon..."
-  sudo systemctl daemon-reload
+  echo "Created user network check timer: ${CHECK_TIMER_FILE}"
 
-  echo "Enabling and starting rclone-mount-${MOUNT_NAME}.service and timer..."
-  sudo systemctl enable --now "rclone-mount-${MOUNT_NAME}.service"
-  sudo systemctl enable --now "rclone-mount-${MOUNT_NAME}-check.timer"
+  echo "Reloading user systemd daemon..."
+  systemctl --user daemon-reload
+
+  echo "Enabling and starting rclone mount service and network check timer..."
+  systemctl --user enable --now "rclone-mount-${MOUNT_NAME}-check.timer"
+
+  # Explicitly mount the drive immediately.
+  echo "Attempting explicit mount..."
+  ${SCRIPT_PATH} mount ${CONFIG_FILE}
+  echo "Waiting a few seconds for the mount to settle..."
+  sleep 5
+
+  if mountpoint -q "$MOUNT_POINT"; then
+    echo "Mount successful: ${MOUNT_POINT} is active."
+    echo "Mount status:"
+    mount | grep "$MOUNT_POINT"
+  else
+    echo "Mount failed: ${MOUNT_POINT} is not mounted."
+  fi
+
   echo "Setup complete."
 }
+
+
+#############################
+# Stop: Disable and stop user systemd unit files.
+#############################
+
+stop_systemd() {
+  echo "Stopping rclone mount service and network check timer..."
+  systemctl --user stop "rclone-mount-${MOUNT_NAME}-check.timer"
+  systemctl --user stop "rclone-mount-${MOUNT_NAME}-check.service"
+  systemctl --user disable "rclone-mount-${MOUNT_NAME}-check.timer"
+  systemctl --user disable "rclone-mount-${MOUNT_NAME}-check.service"
+  echo "Stopped and disabled user systemd units."
+}
+
+#############################
+# List: Show status of the user systemd units.
+#############################
+
+list_systemd() {
+  echo "Listing status of rclone mount related units:"
+  systemctl --user status "rclone-mount-${MOUNT_NAME}.service" \
+    "rclone-mount-${MOUNT_NAME}-check.service" \
+    "rclone-mount-${MOUNT_NAME}-check.timer"
+}
+
 
 #############################
 # Main Command Processing
 #############################
 
 if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 {setup|mount|unmount|check|clean} [config_file]"
+  echo "Usage: $0 {setup|mount|unmount|check|clean|stop|list} [config_file]"
   exit 1
 fi
 
@@ -249,9 +290,15 @@ case "$COMMAND" in
   clean)
     clean_drive
     ;;
+  stop)
+    stop_systemd
+    ;;
+  list)
+    list_systemd
+    ;;
   *)
     echo "Unknown command: $COMMAND"
-    echo "Usage: $0 {setup|mount|unmount|check|clean} [config_file]"
+    echo "Usage: $0 {setup|mount|unmount|check|clean|stop|list} [config_file]"
     exit 1
     ;;
 esac
