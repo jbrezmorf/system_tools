@@ -1,0 +1,146 @@
+#!/bin/bash
+
+set -x
+
+# cron
+# 0 2 * * * /home/jb/bin/borg_backup
+
+# Variables
+MOUNT_POINT="/home/jb/mnt/astra"
+LOCK_FILE="${HOME}/.borg/running_snapshot"
+DAILY_MARKER="${HOME}/.borg/last_backup_date"
+REPO_PATH="${MOUNT_POINT}/private/borg_backup"  # Add your Borg repository path here
+EXCLUDE_FILE="${HOME}/.borg/exclude-file"
+EMAIL="jan.brezina@tul.cz"
+TO_BACKUP="${HOME} /etc"
+BORG_MOUNT_POINT="${HOME}/mnt/borg"
+if [ ! -d ${BORG_MOUNT_POINT} ];then
+    mkdir -p ${BORG_MOUNT_POINT}
+fi
+
+CMD=$1
+if [ "${CMD}" == "mount" ];then
+
+    borg mount ${REPO_PATH} ${BORG_MOUNT_POINT}
+    ls -l ${BORG_MOUNT_POINT}
+    exit 0
+fi
+
+if [ "${CMD}" == "umount" ];then
+    borg umount ${BORG_MOUNT_POINT}
+    exit 0
+fi
+
+
+# Function to send an email
+
+send_notification() {
+    title=$1
+    message=$2
+    notify-send "${title}" "${message}"
+}
+
+
+mount_repo() {
+    # Mount the CIFS share
+    if ! mountpoint -q ${MOUNT_POINT}; then
+        mount ${MOUNT_POINT}
+        if [ $? -ne 0 ]; then
+            send_notification "Backup Failed" "Failed to mount CIFS share."
+            exit 1
+        fi
+    fi
+}
+
+
+if [ "${CMD}" == "--new" ]; then
+    # Force new snapshot
+    # remove both snapshot file and daily marker
+    rm -f "${DAILY_MARKER}"
+    rm -f ${LOCK_FILE}
+    rm -f "${HOME}/.borg/already_running_notice"
+
+fi    
+
+# Check if today's backup is already done
+TODAY=$(date +%Y-%m-%d)
+if [ -f ${DAILY_MARKER} ]; then
+    LAST_BACKUP=$(cat ${DAILY_MARKER})
+    if [ "${LAST_BACKUP}" == "${TODAY}" ]; then
+        # Exit if backup already done today
+        exit 0
+    fi
+fi
+
+mount_repo
+
+if [  ! -d "${REPO_PATH}" ]; then
+    echo "Missing BORG repository, creating a new one."
+    borg init --encryption=none ${REPO_PATH}
+else
+    echo "Backup repository: ${REPO_PATH}"
+    ls ${REPO_PATH}
+fi
+
+
+# Check for an existing snapshot
+if [ -f ${LOCK_FILE} ]; then
+    SNAPSHOT_NAME=$(cat ${LOCK_FILE})
+else
+    SNAPSHOT_NAME="backup_${TODAY}"
+    echo ${SNAPSHOT_NAME} > ${LOCK_FILE}
+fi
+
+# If no BORG is running, force remove the locks
+if ! ps -ef |grep -v borg_backup | grep "[b]org"
+then
+    rm -f ${REPO_PATH}/lock.roster
+    rm -rf ${REPO_PATH}/lock.exclusive
+fi
+
+
+# Start time
+start_time=$(date +%s)
+
+echo "Run the backup: ${SNAPSHOT_NAME}"
+error_output=`borg create --exclude-from ${EXCLUDE_FILE} ${REPO_PATH}::${SNAPSHOT_NAME} ${TO_BACKUP} 2>&1`
+BACKUP_STATUS=$?
+
+
+# End time
+end_time=$(date +%s)
+
+# Calculate duration
+duration=$(( (end_time - start_time) / 60 ))
+
+if [ ! ${BACKUP_STATUS} -eq 0 ]; then
+    # filter Permission denied
+    essential_errors=`echo ${error_output} | grep -v 'Permission denied'`
+    if [ "${essential_errors}" == "" ]; then
+        echo ${error_output}
+        BACKUP_STATUS=0
+    fi
+fi
+    
+# Update daily marker, remove lock file, and send email based on the status
+if [ ${BACKUP_STATUS} -eq 0 ]; then
+    echo ${TODAY} > ${DAILY_MARKER}    
+    rm -f ${LOCK_FILE}
+    rm -f "${HOME}/.borg/already_running_notice"
+    
+    send_notification "Backup Successful" "Backup completed in ${duration} [min]: ${SNAPSHOT_NAME}"
+    exit 0
+fi
+
+
+if echo "${error_output}" | grep -q "Failed to create/acquire the lock"; then
+    # Borg is already running. Send a notification only if this is the first detection.
+    if [ -f "${HOME}/.borg/already_running_notice" ]; then
+        exit 0
+    else
+        touch "${HOME}/.borg/already_running_notice"
+    fi
+fi
+
+send_notification "Backup Failed" "Backup failed in ${duration} [min]: ${error_output}"
+

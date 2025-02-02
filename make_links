@@ -1,0 +1,10 @@
+#!/bin/bash
+
+SCRIPT_PATH=$(realpath "$0")
+
+# make links to used tools in the ${HOME}/bin
+for f in *.sh
+do
+    ln -s ${SCRIPT_PATH}/$f ${HOME}/bin/$f
+    chmod u+x ${HOME}/bin/$f
+done
